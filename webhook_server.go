@@ -35,15 +35,15 @@ import (
 	"syscall"
 	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"golang.org/x/time/rate"
 )
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const (
-	maxBodyBytes     = 512 * 1024     // 512 KB — generous for any webhook payload
+	maxBodyBytes     = 512 * 1024 // 512 KB — generous for any webhook payload
 	cfIPsAPIURL      = "https://api.cloudflare.com/client/v4/ips"
 	cfIPRefreshEvery = 12 * time.Hour // CF IPs change rarely; 12h is safe
 	amqpRetryBase    = 2 * time.Second
@@ -54,11 +54,12 @@ const (
 // ── Config ────────────────────────────────────────────────────────────────────
 
 type Config struct {
-	ListenAddr   string
-	RabbitMQURL  string
-	CFSecret     string
-	GrafanaToken string
-	LANSubnet    string
+	ListenAddr      string
+	RabbitMQURL     string
+	CFSecret        string
+	GrafanaToken    string
+	UptimeKumaToken string
+	LANSubnet       string
 }
 
 func loadConfig() (Config, error) {
@@ -69,11 +70,12 @@ func loadConfig() (Config, error) {
 		return def
 	}
 	cfg := Config{
-		ListenAddr:   get("LISTEN_ADDR", ":8080"),
-		RabbitMQURL:  get("RABBITMQ_URL", "amqp://guest:guest@192.168.15.50:5672/"),
-		CFSecret:     get("CF_WEBHOOK_SECRET", ""),
-		GrafanaToken: get("GRAFANA_WEBHOOK_TOKEN", ""),
-		LANSubnet:    get("LAN_SUBNET", "192.168.15.0/24"),
+		ListenAddr:      get("LISTEN_ADDR", ":8080"),
+		RabbitMQURL:     get("RABBITMQ_URL", "amqp://guest:guest@192.168.15.50:5672/"),
+		CFSecret:        get("CF_WEBHOOK_SECRET", ""),
+		GrafanaToken:    get("GRAFANA_WEBHOOK_TOKEN", ""),
+		UptimeKumaToken: get("UPTIME_KUMA_TOKEN", ""),
+		LANSubnet:       get("LAN_SUBNET", "192.168.15.0/24"),
 	}
 	if cfg.CFSecret == "" {
 		return cfg, fmt.Errorf("CF_WEBHOOK_SECRET must be set")
@@ -444,6 +446,65 @@ func (s *server) handleGrafana(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted"})
 }
 
+// handleUptimeKuma accepts Uptime Kuma webhook notifications.
+//
+// Security layers:
+//  1. POST method enforcement
+//  2. Source IP must be within the LAN subnet (Uptime Kuma is internal)
+//  3. X-Webhook-Token header must equal the configured token (constant-time)
+//
+// If UPTIME_KUMA_TOKEN is not set the endpoint is disabled and returns 404,
+// so it's safe to deploy without Uptime Kuma configured.
+func (s *server) handleUptimeKuma(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.UptimeKumaToken == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ip := realIP(r)
+	if ip == nil || !s.lanNet.Contains(ip) {
+		s.logger.Warn("uptime kuma request from outside LAN — rejected", "ip", ipStr(ip))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if !secureEqual(r.Header.Get("X-Webhook-Token"), s.cfg.UptimeKumaToken) {
+		s.logger.Warn("uptime kuma webhook token mismatch", "ip", ipStr(ip))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	var payload uptimeKumaPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	env := normalizeUptimeKuma(payload)
+	if err := s.mq.publish(env.RoutingKey, env); err != nil {
+		s.logger.Error("failed to publish uptime kuma alert", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	s.logger.Info("uptime kuma alert published",
+		"routing_key", env.RoutingKey,
+		"monitor", payload.Monitor.Name,
+		"status", payload.Heartbeat.Status,
+	)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted"})
+}
+
 // handleHealth is a simple liveness probe — useful for the Homepage dashboard
 // widget and for uptime monitoring via Prometheus/Grafana itself.
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -486,6 +547,24 @@ type grafanaAlert struct {
 	StartsAt    string         `json:"startsAt"`
 	EndsAt      string         `json:"endsAt"`
 	Fingerprint string         `json:"fingerprint"`
+}
+
+// uptimeKumaPayload mirrors the Uptime Kuma webhook notification schema.
+// Reference: https://github.com/louislam/uptime-kuma/wiki/Notification-Methods/webhook
+type uptimeKumaPayload struct {
+	Heartbeat struct {
+		Status   int    `json:"status"` // 1 = up, 0 = down
+		Time     string `json:"time"`
+		Msg      string `json:"msg"`
+		Ping     int    `json:"ping"`
+		Duration int    `json:"duration"`
+	} `json:"heartbeat"`
+	Monitor struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+		Type string `json:"type"`
+	} `json:"monitor"`
+	Msg string `json:"msg"`
 }
 
 // ── Normalisation ─────────────────────────────────────────────────────────────
@@ -618,6 +697,50 @@ func grafanaEvent(state string) string {
 	}
 }
 
+func normalizeUptimeKuma(p uptimeKumaPayload) Envelope {
+	severity := "high"
+	alertEvent := "start"
+	if p.Heartbeat.Status == 1 {
+		severity = "low"
+		alertEvent = "end"
+	}
+
+	monitorName := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(p.Monitor.Name), " ", "_"))
+	if monitorName == "" {
+		monitorName = "unknown"
+	}
+	// Routing key: alert.local.<severity>.uptime_kuma_<monitor_name>
+	// Example: alert.local.high.uptime_kuma_gitea
+	routingKey := fmt.Sprintf("alert.local.%s.uptime_kuma_%s", severity, monitorName)
+
+	title := p.Msg
+	if title == "" {
+		status := "down"
+		if p.Heartbeat.Status == 1 {
+			status = "up"
+		}
+		title = fmt.Sprintf("%s is %s", p.Monitor.Name, status)
+	}
+
+	return Envelope{
+		ID:         uuid.New().String(),
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		Source:     "uptime-kuma",
+		RoutingKey: routingKey,
+		Severity:   severity,
+		AlertEvent: alertEvent,
+		Title:      title,
+		Body:       p.Heartbeat.Msg,
+		Metadata: map[string]any{
+			"monitor_name": p.Monitor.Name,
+			"monitor_url":  p.Monitor.URL,
+			"monitor_type": p.Monitor.Type,
+			"status":       p.Heartbeat.Status,
+			"ping_ms":      p.Heartbeat.Ping,
+		},
+	}
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // secureEqual compares two strings in constant time to prevent timing attacks.
@@ -678,12 +801,13 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest/cloudflare", srv.handleCloudflare)
 	mux.HandleFunc("/ingest/grafana", srv.handleGrafana)
+	mux.HandleFunc("/ingest/uptime-kuma", srv.handleUptimeKuma)
 	mux.HandleFunc("/health", srv.handleHealth)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,  // mitigates Slowloris
+		ReadHeaderTimeout: 5 * time.Second, // mitigates Slowloris
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       120 * time.Second,
