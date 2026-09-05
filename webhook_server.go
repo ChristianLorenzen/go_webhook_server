@@ -76,12 +76,17 @@ func loadConfig() (Config, error) {
 	}
 	cfg := Config{
 		ListenAddr:       get("LISTEN_ADDR", ":8080"),
-		RabbitMQURL:      get("RABBITMQ_URL", "amqp://guest:guest@192.168.15.50:5672/"),
+		RabbitMQURL:      get("RABBITMQ_URL", ""),
 		CFSecret:         get("CF_WEBHOOK_SECRET", ""),
 		GrafanaToken:     get("GRAFANA_WEBHOOK_TOKEN", ""),
 		UptimeKumaToken:  get("UPTIME_KUMA_TOKEN", ""),
 		AlertIngestToken: get("ALERT_INGEST_TOKEN", ""),
 		LANSubnet:        get("LAN_SUBNET", "192.168.15.0/24"),
+	}
+	// Fail loudly rather than silently falling back to guest:guest — a missing
+	// RABBITMQ_URL used to surface much later as an opaque 403 from the broker.
+	if cfg.RabbitMQURL == "" {
+		return cfg, fmt.Errorf("RABBITMQ_URL must be set")
 	}
 	if cfg.CFSecret == "" {
 		return cfg, fmt.Errorf("CF_WEBHOOK_SECRET must be set")
