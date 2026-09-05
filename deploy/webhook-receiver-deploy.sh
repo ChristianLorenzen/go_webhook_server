@@ -63,6 +63,10 @@ done
 
 if [[ "$healthy" != "true" ]]; then
     log "Health check FAILED — rolling back"
+    # Keep the failing binary so it can be run by hand for diagnosis; the rollback
+    # below overwrites $DEST and would otherwise destroy the evidence.
+    cp -a "$DEST" /tmp/webhook-receiver-failed 2>/dev/null || true
+    log "Failing binary preserved at /tmp/webhook-receiver-failed"
     systemctl stop "$SERVICE" || true
     if [[ -f "$PREV" ]]; then
         install -m 0755 -o root -g root "$PREV" "$DEST"
