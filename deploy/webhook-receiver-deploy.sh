@@ -18,6 +18,7 @@ STAGED="/tmp/webhook-receiver-new"
 DEST="/usr/local/bin/webhook-receiver"
 PREV="/usr/local/bin/webhook-receiver.prev"
 HEALTH_URL="http://localhost:8080/health"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-45}"   # seconds to wait for /health after start
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 fail() { echo "[$(date '+%H:%M:%S')] ✗ $*" >&2; exit 1; }
@@ -42,9 +43,25 @@ rm -f "$STAGED"
 
 log "Starting $SERVICE..."
 systemctl start "$SERVICE"
-sleep 2
 
-if ! curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+# Poll rather than sleep-once: startup dials RabbitMQ and fetches the Cloudflare IP
+# list (blocking, up to 15s) BEFORE the HTTP listener binds, so /health can legitimately
+# take several seconds. Bail out early if the process dies instead of waiting it out.
+log "Waiting for $SERVICE to become healthy (up to ${HEALTH_TIMEOUT}s)..."
+healthy=false
+for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
+    if curl -fsS --max-time 3 "$HEALTH_URL" >/dev/null 2>&1; then
+        healthy=true
+        break
+    fi
+    if ! systemctl is-active --quiet "$SERVICE"; then
+        log "$SERVICE exited during startup"
+        break
+    fi
+    sleep 1
+done
+
+if [[ "$healthy" != "true" ]]; then
     log "Health check FAILED — rolling back"
     systemctl stop "$SERVICE" || true
     if [[ -f "$PREV" ]]; then
