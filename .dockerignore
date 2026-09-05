@@ -1,0 +1,6 @@
+.git
+.gitea
+webhook-receiver
+webhook-receiver.prev
+*.md
+LICENSE

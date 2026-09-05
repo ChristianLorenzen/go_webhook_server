@@ -1,0 +1,24 @@
+# Build-only image: compiles the static webhook-receiver binary.
+#
+# CI uses `docker build` (which STREAMS the build context through the daemon API)
+# rather than `docker run -v "$PWD":/src`. On a Gitea runner that executes jobs in a
+# container while talking to the host's Docker daemon, a bind mount of $PWD resolves
+# against the HOST filesystem and silently comes up empty — docker build is immune.
+
+FROM golang:1.23-alpine
+
+WORKDIR /src
+
+# Cache dependency download as its own layer.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# CGO_ENABLED=0 → fully static binary, independent of the VM's glibc version.
+ENV CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+RUN go vet ./... \
+    && go build -trimpath -ldflags "-s -w" -o /out/webhook-receiver .
