@@ -11,12 +11,16 @@ package main
 //                        AND cf-webhook-auth header must match configured secret
 //   /ingest/grafana    — source IP must be within the configured LAN subnet
 //                        AND X-Webhook-Token header must match configured token
+//   /ingest/alert/v1   — generic in-house ingress (see alert_ingest.go): LAN subnet
+//                        AND X-Ingest-Token, with full field sanitisation
 //
 // Configuration (environment variables):
 //   LISTEN_ADDR            HTTP listen address (default :8080)
 //   RABBITMQ_URL           AMQP URL (default amqp://guest:guest@192.168.15.50:5672/)
 //   CF_WEBHOOK_SECRET      Secret set in Cloudflare Notifications → Destinations → Webhooks
 //   GRAFANA_WEBHOOK_TOKEN  Shared token set in Grafana contact point header
+//   UPTIME_KUMA_TOKEN      Shared token for Uptime Kuma (endpoint disabled if unset)
+//   ALERT_INGEST_TOKEN     Shared secret for /ingest/alert/v1 (endpoint disabled if unset)
 //   LAN_SUBNET             CIDR for internal clients (default 192.168.15.0/24)
 
 import (
@@ -54,12 +58,13 @@ const (
 // ── Config ────────────────────────────────────────────────────────────────────
 
 type Config struct {
-	ListenAddr      string
-	RabbitMQURL     string
-	CFSecret        string
-	GrafanaToken    string
-	UptimeKumaToken string
-	LANSubnet       string
+	ListenAddr       string
+	RabbitMQURL      string
+	CFSecret         string
+	GrafanaToken     string
+	UptimeKumaToken  string
+	AlertIngestToken string
+	LANSubnet        string
 }
 
 func loadConfig() (Config, error) {
@@ -70,12 +75,13 @@ func loadConfig() (Config, error) {
 		return def
 	}
 	cfg := Config{
-		ListenAddr:      get("LISTEN_ADDR", ":8080"),
-		RabbitMQURL:     get("RABBITMQ_URL", "amqp://guest:guest@192.168.15.50:5672/"),
-		CFSecret:        get("CF_WEBHOOK_SECRET", ""),
-		GrafanaToken:    get("GRAFANA_WEBHOOK_TOKEN", ""),
-		UptimeKumaToken: get("UPTIME_KUMA_TOKEN", ""),
-		LANSubnet:       get("LAN_SUBNET", "192.168.15.0/24"),
+		ListenAddr:       get("LISTEN_ADDR", ":8080"),
+		RabbitMQURL:      get("RABBITMQ_URL", "amqp://guest:guest@192.168.15.50:5672/"),
+		CFSecret:         get("CF_WEBHOOK_SECRET", ""),
+		GrafanaToken:     get("GRAFANA_WEBHOOK_TOKEN", ""),
+		UptimeKumaToken:  get("UPTIME_KUMA_TOKEN", ""),
+		AlertIngestToken: get("ALERT_INGEST_TOKEN", ""),
+		LANSubnet:        get("LAN_SUBNET", "192.168.15.0/24"),
 	}
 	if cfg.CFSecret == "" {
 		return cfg, fmt.Errorf("CF_WEBHOOK_SECRET must be set")
@@ -293,6 +299,10 @@ type server struct {
 	// 10 req/s sustained, burst of 20. Actual CF notification volume is very
 	// low; this only triggers on abuse or scanning from CF IP space.
 	cfLimiter *rate.Limiter
+	// Rate limiter for /ingest/alert/v1. In-house alert volume is low; this caps how
+	// fast any internal (or compromised) service can drive notifications to Discord.
+	// 5 req/s sustained, burst of 20.
+	alertLimiter *rate.Limiter
 }
 
 func newServer(cfg Config, logger *slog.Logger) (*server, error) {
@@ -305,12 +315,13 @@ func newServer(cfg Config, logger *slog.Logger) (*server, error) {
 		return nil, err
 	}
 	return &server{
-		cfg:       cfg,
-		mq:        mq,
-		cfIPs:     newCFIPList(logger),
-		lanNet:    lanNet,
-		logger:    logger,
-		cfLimiter: rate.NewLimiter(rate.Every(100*time.Millisecond), 20),
+		cfg:          cfg,
+		mq:           mq,
+		cfIPs:        newCFIPList(logger),
+		lanNet:       lanNet,
+		logger:       logger,
+		cfLimiter:    rate.NewLimiter(rate.Every(100*time.Millisecond), 20),
+		alertLimiter: rate.NewLimiter(rate.Every(200*time.Millisecond), 20),
 	}, nil
 }
 
@@ -802,6 +813,7 @@ func main() {
 	mux.HandleFunc("/ingest/cloudflare", srv.handleCloudflare)
 	mux.HandleFunc("/ingest/grafana", srv.handleGrafana)
 	mux.HandleFunc("/ingest/uptime-kuma", srv.handleUptimeKuma)
+	mux.HandleFunc("/ingest/alert/v1", srv.handleAlertV1)
 	mux.HandleFunc("/health", srv.handleHealth)
 
 	httpSrv := &http.Server{
