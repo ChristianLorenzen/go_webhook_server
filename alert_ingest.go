@@ -71,7 +71,6 @@ const (
 	alertMaxFieldValueLen = 512
 	alertMaxLinkLen       = 2048
 	alertMaxDedupeKeyLen  = 128
-	alertMaxBodyLen       = 6000 // message + rendered fields + link
 )
 
 // ── Payload ───────────────────────────────────────────────────────────────────
@@ -265,32 +264,12 @@ func normalizeAlertV1(p alertPayloadV1) (Envelope, error) {
 		Severity:   severity,
 		AlertEvent: "",
 		Title:      neutralizeMentions(title),
-		Body:       neutralizeMentions(buildAlertBody(message, fields, link)),
-		Metadata:   metadata,
+		// Body is the message ONLY. Fields/link/tags stay structured in Metadata so
+		// each consumer can present them properly (e.g. Discord markdown embeds).
+		// Flattening them in here would bake one presentation into the transport.
+		Body:     neutralizeMentions(message),
+		Metadata: metadata,
 	}, nil
-}
-
-// buildAlertBody renders the human-readable body: the message is always a complete
-// alert on its own; fields and link are appended so they're visible in Discord,
-// which only receives title + body text.
-func buildAlertBody(message string, fields []map[string]string, link string) string {
-	var b strings.Builder
-	b.WriteString(message)
-	for _, f := range fields {
-		b.WriteString("\n")
-		switch {
-		case f["name"] == "":
-			b.WriteString(f["value"])
-		case f["value"] == "":
-			b.WriteString(f["name"])
-		default:
-			b.WriteString(f["name"] + ": " + f["value"])
-		}
-	}
-	if link != "" {
-		b.WriteString("\n" + link)
-	}
-	return truncateRunes(b.String(), alertMaxBodyLen)
 }
 
 // ── Sanitisation helpers ──────────────────────────────────────────────────────
